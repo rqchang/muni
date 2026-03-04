@@ -39,6 +39,7 @@ library(data.table)
 library(zoo)
 library(lubridate)
 library(timeDate)
+library(ggplot2)
 
 # Source helper scripts
 source('utils/setPaths.R')
@@ -295,11 +296,161 @@ for (k in seq_along(years)) {
   message(sprintf("%d processed and saved.", year))
 }
 
-data_summary <- rbindlist(data_summary_list, use.names = TRUE, fill = TRUE)
+sum <- rbindlist(data_summary_list, use.names = TRUE, fill = TRUE)
+saveRDS(sum, paste0(PROCDIR, "MSRB/trade_sum_year.rds"))
 
+# ================================================================= #
+# Plots ####
+# ================================================================= #
+# ------------------------------------------------- #
+# Share of retail trade
+# ------------------------------------------------- #
+sum <- sum[year <= 2024]
+sum[, share_retail := num_trade_retail / num_trade]
 
+p1 <- ggplot(sum, aes(x = year, y = share_retail)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(
+    breaks = seq(min(plot_dt$year, na.rm = TRUE),
+                 max(plot_dt$year, na.rm = TRUE),
+                 by = 2)
+  ) +
+  labs(
+    title = NULL,
+    x = "Year",
+    y = "Retail share (by trade count)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.line.x = element_line(color = "black", linewidth = 0.5),
+    axis.line.y = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black"),
+    axis.ticks.length = unit(3, "pt"),
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_blank()
+  )
 
+ggsave(
+  filename = file.path(OUTDIR, "plots/trade/share_retail_y.pdf"),
+  plot     = p1,
+  width    = 7,
+  height   = 4.5
+)
 
+# ------------------------------------------------- #
+# Share of P vs S vs D
+# ------------------------------------------------- #
+sum[, `:=`(
+  share_P = paramt_P / totparamt,
+  share_S = paramt_S / totparamt,
+  share_D = paramt_D / totparamt
+)]
+sum[, max(share_P + share_S + share_D, na.rm = TRUE)]
+sum[, sum_share := share_P + share_S + share_D]
 
+plot_dt <- melt(
+  sum,
+  id.vars = "year",
+  measure.vars = c("share_P", "share_S", "share_D"),
+  variable.name = "type",
+  value.name = "share"
+)
 
+plot_dt[, type := factor(
+  type,
+  levels = c("share_D", "share_S", "share_P"),
+  labels = c("Inter-dealer ", "Sale to a customer by a dealer ", "Purchase from a customer by a dealer")
+)]
+
+p2 <- ggplot(plot_dt, aes(x = year, y = share, color = type)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(
+    breaks = seq(min(plot_dt$year, na.rm = TRUE),
+                 max(plot_dt$year, na.rm = TRUE),
+                 by = 2)
+  ) +
+  labs(
+    title = NULL,
+    x = "Year",
+    y = "Share of total par traded",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.line.x      = element_line(color = "black", linewidth = 0.5),
+    axis.line.y      = element_line(color = "black", linewidth = 0.5),
+    axis.ticks       = element_line(color = "black"),
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "top"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "plots/trade/share_trade_type_y.pdf"),
+  plot     = p2,
+  width    = 7,
+  height   = 4.5
+)
+
+# ------------------------------------------------- #
+# Number of trade and TOTPARAMT
+# ------------------------------------------------- #
+scale_factor <- max(sum$num_trade, na.rm = TRUE) / 
+  max(sum$totparamt,  na.rm = TRUE)
+
+p3 <- ggplot(sum, aes(x = year)) +
+  geom_line(
+    aes(y = num_trade / 1e3, color = "Number of trades"),
+    linewidth = 1.2
+  ) +
+  geom_line(
+    aes(y = totparamt * scale_factor / 1e3, color = "Total par traded"),
+    linewidth = 1.2,
+    linetype = "dashed"
+  ) +
+  scale_y_continuous(
+    name = "Number of trades (thousands)",
+    labels = scales::comma,
+    sec.axis = sec_axis(
+      ~ . / scale_factor * 1e3,
+      name = "Total par traded (USD, billions)"
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(min(sum$year), max(sum$year), by = 2)
+  ) +
+  scale_color_manual(
+    values = c(
+      "Number of trades" = "steelblue",
+      "Total par traded" = "darkred"
+    )
+  ) +
+  labs(
+    x = "Year",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.line.x      = element_line(color = "black", linewidth = 0.6),
+    axis.line.y      = element_line(color = "black", linewidth = 0.6),
+    axis.ticks       = element_line(color = "black"),
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "top"
+  )
+
+ggsave(
+  filename = file.path(OUTDIR, "plots/trade/totparamt_y.pdf"),
+  plot     = p3,
+  width    = 7,
+  height   = 4.5
+)
 
