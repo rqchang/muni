@@ -299,6 +299,7 @@ for (k in seq_along(years)) {
 sum <- rbindlist(data_summary_list, use.names = TRUE, fill = TRUE)
 saveRDS(sum, paste0(PROCDIR, "MSRB/trade_sum_year.rds"))
 
+
 # ================================================================= #
 # Plots ####
 # ================================================================= #
