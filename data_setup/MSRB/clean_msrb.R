@@ -156,12 +156,6 @@ for (k in seq_along(years)) {
   
   original_rows <- nrow(dt)
   starting_rows <- original_rows
-  
-  ## Select columns
-  dt <- dt[, .(cusip, trade_date, trade_type_indicator, cusip6, rtrs_control_number,
-               dated_date, coupon, maturity_date, when_issued_indicator, settlement_date, 
-               assumed_settlement_date,par_traded, dollar_price, yield, brokers_broker_indicator,
-               uv_dollar_price_indicator, ats_indicator, ntbc_indicator, security_description)]
   message(sprintf("Read row data rows: %d", original_rows))
   
   ## --- Step 1.1: business days + non-holidays ---
