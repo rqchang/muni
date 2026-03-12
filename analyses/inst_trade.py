@@ -12,12 +12,12 @@ Institutional signals
 ---------------------
   Flag-based (lower bound, customer odd-lots only):
     NOTE: ATS and BB are inter-dealer (D) only fields — always null on customer
-    trades (P/S), so inst_channel for customer trades reduces to ntbc | wap.
+    trades (P/S), so inst_flag for customer trades reduces to ntbc | wap.
     ATS:   ats_indicator == "Y"                   [D trades only]
     BB:    brokers_broker_indicator in {"P","S"}  [D trades only]
     NTBC:  ntbc_indicator == "Y"                  [customer trades; no markup charged → institutional]
     WAP:   weighted_price_indicator == "Y"        [averaged/systematic pricing → institutional]
-    inst_channel = any of the above
+    inst_flag = any of the above
 
   SMA clustering (Bagley & Vieira, MSRB 2025):
     SMAs rebalance across many client accounts simultaneously, producing clusters
@@ -25,28 +25,29 @@ Institutional signals
     almost never generate.
     cluster_ct  = count of same (cusip, trade_date, trade_type_indicator, trade_hour) customer trades
                   trade_hour = floor(time_of_trade_seconds / 3600)
-    inst_sma    = cluster_ct >= SMA_MIN_TRADES  (default: 3)
+    inst_cluster    = cluster_ct >= SMA_MIN_TRADES  (default: 3)
 
   Markup-based (Harris & Piwowar 2006; Green, Hollifield & Schürhoff 2007):
-    ref_price   = median dollar_price of same-CUSIP same-day inter-dealer (D) trades
+    ref_price   = median dollar_price of D trades for same CUSIP within 1 calendar day
+                  (date-1, date, date+1 pooled together)
     markup      = |customer_price - ref_price| / ref_price
-    inst_markup = markup < MARKUP_THRESH  (default: 20 bps)
-    Only defined for customer trades with at least one same-day D trade.
+    inst_markup = markup < MARKUP_THRESH  (default: 30 bps)
+    Only defined for customer trades with at least one D-trade within the 1-day window.
 
   Combined:
-    inst_combined = inst_channel | inst_sma | inst_markup
+    inst_combined = inst_flag | inst_cluster | inst_markup
     (markup component requires a valid ref_price)
 
 Data availability notes
 -------------------------------------------------
 - 2005–2010: All indicator fields (ATS, NTBC, BB) are entirely null — MSRB did
-  not collect them in early years. inst_channel = 0 for these years by design.
+  not collect them in early years. inst_flag = 0 for these years by design.
 - BB (brokers_broker_indicator) first appears in ~2012.
 - ATS and NTBC first appear in ~2016 when MSRB mandated their reporting.
 - 2005–2011 data contains only customer (P/S) trades — no inter-dealer (D) trades
   are present in the WRDS export. This means ref_price is undefined and
   inst_markup = 0 for those years.
-- inst_sma (SMA clustering) is the only signal available across the full 2005–2025
+- inst_cluster (SMA clustering) is the only signal available across the full 2005–2025
   window and is the primary vehicle for tracking institutionalization trends over time.
 """
 
@@ -58,7 +59,7 @@ import matplotlib.ticker as mtick
 from tqdm import tqdm
 from utils.set_paths import PROC_DIR, OUT_DIR
 
-MARKUP_THRESH  = 0.0020   # 20 basis points
+MARKUP_THRESH  = 0.0030   # 30 basis points
 SMA_MIN_TRADES = 3        # min same-direction customer trades on same CUSIP-date → SMA cluster
 
 logfile = os.path.join(PROC_DIR, "MSRB", "institutionalization_log.txt")
@@ -99,7 +100,7 @@ for y in tqdm(years):
     dt = pd.read_csv(f, usecols=USECOLS, low_memory=False)
     n_before = len(dt)
 
-    # Drop primary takedowns
+    " Drop primary takedowns "
     if "offer_price_takedown_indicator" in dt.columns:
         dt = dt[dt["offer_price_takedown_indicator"] != "Y"]
         log("Dropped primary takedown trades using offer_price_takedown_indicator.")
@@ -122,14 +123,14 @@ for y in tqdm(years):
     " Dealer flag signal "
     # NOTE: ats_indicator and brokers_broker_indicator are inter-dealer (D)
     # only fields — they are always null on customer trades (P/S) and
-    # therefore contribute nothing to inst_channel for customer odd-lots.
+    # therefore contribute nothing to inst_flag for customer odd-lots.
     dt["inst_ats"]  = dt["ats_indicator"].isin(["Y"])
     dt["inst_bb"]   = dt["brokers_broker_indicator"].isin(["P", "S"])
     dt["inst_ntbc"] = dt["ntbc_indicator"].isin(["Y"])
     dt["inst_wap"]  = dt["weighted_price_indicator"].isin(["Y"])
 
     # For customer trades, the effective flag-based channel is ntbc | wap only.
-    dt["inst_channel"] = dt[["inst_ats", "inst_bb", "inst_ntbc", "inst_wap"]].any(axis=1)
+    dt["inst_flag"] = dt[["inst_ats", "inst_bb", "inst_ntbc", "inst_wap"]].any(axis=1)
 
     " Clustered trading signal "
     # SMAs rebalance across many client accounts → multiple small same-direction
@@ -139,23 +140,29 @@ for y in tqdm(years):
     # time_of_trade is in seconds since midnight; floor to hour bucket.
     dt["trade_hour"] = pd.to_numeric(dt["time_of_trade"], errors="coerce") // 3600
     cust_mask = dt["customer_trade"]
-    dt["inst_sma"] = False
+    dt["inst_cluster"] = False
     if cust_mask.sum() > 0:
         cluster_ct = (
             dt.loc[cust_mask]
             .groupby(["cusip", "trade_date", "trade_type_indicator", "trade_hour"])["cusip"]
             .transform("count")
         )
-        dt.loc[cust_mask, "inst_sma"] = cluster_ct >= SMA_MIN_TRADES
+        dt.loc[cust_mask, "inst_cluster"] = cluster_ct >= SMA_MIN_TRADES
 
     " Markup-based institutional signal "
-    # Reference price: median dealer-to-dealer price per CUSIP-date
-    ref = (
-        dt[dt["dealer_trade"] & dt["dollar_price"].notna()]
-        .groupby(["cusip", "trade_date"], as_index=False)["dollar_price"]
-        .median()
-        .rename(columns={"dollar_price": "ref_price"})
-    )
+    # Reference price: median dollar_price of D trades for the same CUSIP
+    # within 1 calendar day (date-1, date, date+1 pooled).
+    # Each D trade is expanded to cover the three customer-trade dates it
+    # can serve as a reference for, then median is taken per (cusip, date).
+    dt["trade_date"] = pd.to_datetime(dt["trade_date"])
+    d_trades = dt.loc[dt["dealer_trade"] & dt["dollar_price"].notna(),
+                      ["cusip", "trade_date", "dollar_price"]]
+    ref = pd.concat([
+        d_trades.assign(trade_date=d_trades["trade_date"] - pd.Timedelta(days=1)),
+        d_trades,
+        d_trades.assign(trade_date=d_trades["trade_date"] + pd.Timedelta(days=1)),
+    ]).groupby(["cusip", "trade_date"], as_index=False)["dollar_price"].median() \
+      .rename(columns={"dollar_price": "ref_price"})
     n_ref_cusip_days = len(ref)
 
     dt = pd.merge(dt, ref, on=["cusip", "trade_date"], how="left")
@@ -170,7 +177,7 @@ for y in tqdm(years):
     dt["inst_markup"] = dt["markup"] < MARKUP_THRESH   # NaN < threshold → False
 
     # Combined: flag-based OR SMA-cluster OR markup-based (customer trades)
-    dt["inst_combined"] = dt["inst_channel"] | dt["inst_sma"] | dt["inst_markup"]
+    dt["inst_combined"] = dt["inst_flag"] | dt["inst_cluster"] | dt["inst_markup"]
 
     pct_with_ref = 100 * has_ref.sum() / dt["customer_trade"].sum() if dt["customer_trade"].sum() > 0 else float("nan")
     log(f"Customer trades with a ref price: {has_ref.sum():,} / {dt['customer_trade'].sum():,} ({pct_with_ref:.1f}%)")
@@ -195,33 +202,33 @@ for y in tqdm(years):
         return (sub["par_traded"] * sub[col]).sum() / denom if denom > 0 else float("nan")
 
     # flag-based (all odd-lots)
-    inst_all_count  = _count_share(odd,      "inst_channel")
-    inst_all_vol    = _vol_share(odd,         "inst_channel")
+    inst_all_count  = _count_share(odd, "inst_flag")
+    inst_all_vol    = _vol_share(odd, "inst_flag")
 
     # flag-based (customer odd-lots)
-    inst_cust_count = _count_share(cust_odd, "inst_channel")
-    inst_cust_vol   = _vol_share(cust_odd,   "inst_channel")
+    inst_cust_count = _count_share(cust_odd, "inst_flag")
+    inst_cust_vol   = _vol_share(cust_odd, "inst_flag")
 
-    # SMA-cluster (customer odd-lots)
-    inst_sma_count = _count_share(cust_odd,  "inst_sma")
-    inst_sma_vol   = _vol_share(cust_odd,    "inst_sma")
+    # cluster-based (customer odd-lots)
+    inst_cluster_count = _count_share(cust_odd, "inst_cluster")
+    inst_cluster_vol   = _vol_share(cust_odd, "inst_cluster")
 
     # markup-based (all customer odd-lots; inst_markup is False where ref_price is missing,
     # so the rate reflects both signal strength and ref-price coverage)
     cust_odd_ref = cust_odd[cust_odd["ref_price"].notna()]   # kept for ref_cov and diagnostics
     inst_markup_count = _count_share(cust_odd, "inst_markup")
-    inst_markup_vol   = _vol_share(cust_odd,   "inst_markup")
+    inst_markup_vol   = _vol_share(cust_odd, "inst_markup")
 
     # combined: same denominator as all other signals
     inst_combined_count = _count_share(cust_odd, "inst_combined")
-    inst_combined_vol   = _vol_share(cust_odd,   "inst_combined")
+    inst_combined_vol   = _vol_share(cust_odd, "inst_combined")
 
     # Ref-price coverage (customer odd-lots)
     ref_cov = len(cust_odd_ref) / len(cust_odd) if len(cust_odd) > 0 else float("nan")
 
     # Signal overlap decomposition (customer odd-lots)
-    f  = cust_odd["inst_channel"]
-    s  = cust_odd["inst_sma"]
+    f  = cust_odd["inst_flag"]
+    s  = cust_odd["inst_cluster"]
     m  = cust_odd["inst_markup"]   # False where ref_price missing
     n_co = len(cust_odd)
     overlap = {
@@ -236,7 +243,7 @@ for y in tqdm(years):
         "n_none":         int((~f & ~s & ~m).sum()),
     }
     log(
-        f"  Ref-price coverage: {ref_cov*100:.1f}% | "
+        f"Ref-price coverage: {ref_cov*100:.1f}% | "
         f"Combined inst: {overlap['n_combined']/n_co*100:.1f}% | "
         f"Only-flag: {overlap['n_only_flag']/n_co*100:.1f}% | "
         f"Only-SMA: {overlap['n_only_sma']/n_co*100:.1f}% | "
@@ -247,8 +254,10 @@ for y in tqdm(years):
     # P vs S split (customer odd-lots)
     cust_odd_P = dt[dt["odd_lot"] & (dt["trade_type_indicator"] == "P")]
     cust_odd_S = dt[dt["odd_lot"] & (dt["trade_type_indicator"] == "S")]
-    inst_sma_P_count = _count_share(cust_odd_P, "inst_sma")
-    inst_sma_S_count = _count_share(cust_odd_S, "inst_sma")
+    ps_stats = {}
+    for sig in ["inst_flag", "inst_cluster", "inst_markup", "inst_combined"]:
+        ps_stats[f"{sig}_P_count"] = _count_share(cust_odd_P, sig)
+        ps_stats[f"{sig}_S_count"] = _count_share(cust_odd_S, sig)
 
     # Size-bucket SMA (customer odd-lots)
     SIZE_BUCKETS = [
@@ -260,61 +269,78 @@ for y in tqdm(years):
     stats_by_bucket = {}
     for label, lo, hi in SIZE_BUCKETS:
         bkt = cust_odd[(cust_odd["par_traded"] > lo) & (cust_odd["par_traded"] <= hi)]
-        stats_by_bucket[f"inst_sma_{label}"]      = _count_share(bkt, "inst_sma")
-        stats_by_bucket[f"inst_channel_{label}"]  = _count_share(bkt, "inst_channel")
-        stats_by_bucket[f"inst_markup_{label}"]   = _count_share(bkt, "inst_markup")
+        stats_by_bucket[f"inst_cluster_{label}"] = _count_share(bkt, "inst_cluster")
+        stats_by_bucket[f"inst_flag_{label}"] = _count_share(bkt, "inst_flag")
+        stats_by_bucket[f"inst_markup_{label}"] = _count_share(bkt, "inst_markup")
         stats_by_bucket[f"inst_combined_{label}"] = _count_share(bkt, "inst_combined")
 
-    # Block-trade combined signal calibration: ≥$1M customer trades should be
-    # nearly all institutional. Combined should outperform SMA alone here since
-    # large CUSIPs are more liquid (higher ref_price coverage) and may carry NTBC/WAP flags.
-    block = dt[dt["customer_trade"] & (dt["par_traded"] >= 1_000_000)]
-    block_ref = block[block["ref_price"].notna()]   # kept for ref_cov_block
-    inst_sma_block_count      = _count_share(block, "inst_sma")
-    inst_channel_block_count  = _count_share(block, "inst_channel")
-    inst_markup_block_count   = _count_share(block, "inst_markup")
-    inst_combined_block_count = _count_share(block, "inst_combined")
-    ref_cov_block = len(block_ref) / len(block) if len(block) > 0 else float("nan")
-    n_block = len(block)
+    # Block-trade calibration: ≥$1M trades — customer, dealer, and all
+    # Goal: among all large trades, the combined institutional signal should
+    # cover a much higher fraction than in odd-lots, validating the measure.
+    # Dealer (D) trades are almost entirely institutional by definition;
+    # inst_flag (ATS | BB) fires on D trades, so they are a natural upper-bound check.
+    BLOCK_SEGMENTS = [
+        ("block_cust",   dt["customer_trade"] & (dt["par_traded"] >= 1_000_000)),
+        ("block_dealer", dt["dealer_trade"]   & (dt["par_traded"] >= 1_000_000)),
+        ("block_all",                            dt["par_traded"] >= 1_000_000),
+    ]
+    block_stats = {}
+    for seg_name, mask in BLOCK_SEGMENTS:
+        seg = dt[mask]
+        n   = len(seg)
+        block_stats[f"n_{seg_name}"] = n
+        block_stats[f"ref_cov_{seg_name}"] = (
+            seg["ref_price"].notna().sum() / n if n > 0 else float("nan")
+        )
+        for sig in ["inst_flag", "inst_cluster", "inst_markup", "inst_combined"]:
+            block_stats[f"{sig}_{seg_name}_count"] = _count_share(seg, sig)
+
+    # Dealer odd-lot signal rates (robustness: inst_cluster and inst_markup are
+    # customer-only by construction → should be ~0 for D-trades; inst_flag
+    # should be non-zero since ATS/BB indicators fire on dealer (D) trades)
+    dealer_odd = dt[dt["dealer_trade"] & dt["odd_lot"]]
+    n_do = len(dealer_odd)
+    dealer_odd_stats = {
+        "n_dealer_oddlot":      n_do,
+        "par_dealer_oddlot_bn": dealer_odd["par_traded"].sum() / 1e9,
+    }
+    for sig in ["inst_flag", "inst_cluster", "inst_markup", "inst_combined"]:
+        dealer_odd_stats[f"{sig}_dealer_odd_count"] = _count_share(dealer_odd, sig)
+        dealer_odd_stats[f"{sig}_dealer_odd_vol"]   = _vol_share(dealer_odd, sig)
 
     results.append({
-        "year":                  y,
-        "n_trades":              n_trades,
-        "n_oddlot":              n_oddlot,
-        "n_cust_oddlot":         n_cust_oddlot,
-        "par_total_bn":          par_total       / 1e9,
-        "par_oddlot_bn":         par_oddlot      / 1e9,
-        "par_cust_oddlot_bn":    par_cust_oddlot / 1e9,
-        # flag-based
-        "inst_all_count":        inst_all_count,
-        "inst_all_vol":          inst_all_vol,
-        "inst_cust_count":       inst_cust_count,
-        "inst_cust_vol":         inst_cust_vol,
-        # SMA clustering
-        "inst_sma_count":        inst_sma_count,
-        "inst_sma_vol":          inst_sma_vol,
-        # markup-based
-        "inst_markup_count":     inst_markup_count,
-        "inst_markup_vol":       inst_markup_vol,
-        # combined: flag | sma | markup
-        "inst_combined_count":   inst_combined_count,
-        "inst_combined_vol":     inst_combined_vol,
+        "year":               y,
+        "n_trades":           n_trades,
+        "n_oddlot":           n_oddlot,
+        "n_cust_oddlot":      n_cust_oddlot,
+        "par_total_bn":       par_total       / 1e9,
+        "par_oddlot_bn":      par_oddlot      / 1e9,
+        "par_cust_oddlot_bn": par_cust_oddlot / 1e9,
+        # all-odd-lots flag baseline
+        "inst_all_count":     inst_all_count,
+        "inst_all_vol":       inst_all_vol,
+
+        # institutional share of customer odd-lots: 3 signals and combined
+        "inst_cust_count":    inst_cust_count,
+        "inst_cust_vol":      inst_cust_vol,
+        "inst_cluster_count": inst_cluster_count,
+        "inst_cluster_vol":   inst_cluster_vol,
+        "inst_markup_count":  inst_markup_count,
+        "inst_markup_vol":    inst_markup_vol,
+        "inst_combined_count":inst_combined_count,
+        "inst_combined_vol":  inst_combined_vol,
 
         # ref-price coverage and signal overlap
-        "ref_price_cov":         ref_cov,
-        **{k: v for k, v in overlap.items()},
-        # P vs S SMA split
-        "inst_sma_P_count":      inst_sma_P_count,
-        "inst_sma_S_count":      inst_sma_S_count,
-        # size-bucket signals (sma, channel, markup, combined)
+        "ref_price_cov":      ref_cov,
+        **overlap,
+        # P vs S split
+        **ps_stats,
+        # size-bucket
         **stats_by_bucket,
-        # block-trade calibration (≥$1M customer trades)
-        "inst_sma_block_count":      inst_sma_block_count,
-        "inst_channel_block_count":  inst_channel_block_count,
-        "inst_markup_block_count":   inst_markup_block_count,
-        "inst_combined_block_count": inst_combined_block_count,
-        "ref_cov_block":             ref_cov_block,
-        "n_block":                   n_block,
+        # block-trade calibration
+        **block_stats,
+        # dealer odd-lot signal rates
+        **dealer_odd_stats,
     })
 
     del dt
@@ -323,45 +349,6 @@ for y in tqdm(years):
 summary_year = pd.DataFrame(results)
 summary_year.to_csv(os.path.join(PROC_DIR, "MSRB/oddlot_sum_year.csv"), index=False)
 log("Saved summary_year.")
-
-
-" Sanity checks "
-valid = summary_year[summary_year["n_cust_oddlot"] > 0].copy()
-diag_cols = [
-    "year", "n_cust_oddlot",
-    "ref_price_cov",
-    "inst_cust_count", "inst_sma_count", "inst_markup_count", "inst_combined_count",
-    "n_only_flag", "n_only_sma", "n_only_markup",
-    "n_flag_sma", "n_flag_markup", "n_sma_markup", "n_all_three",
-    "n_combined", "n_none",
-]
-diag = valid[[c for c in diag_cols if c in valid.columns]].copy()
-
-# Format share columns as percentages for readability
-for col in ["ref_price_cov", "inst_cust_count", "inst_sma_count",
-            "inst_markup_count", "inst_combined_count"]:
-    if col in diag.columns:
-        diag[col] = (diag[col] * 100).round(1)
-
-print("\n=== Sanity Check: Combined Institutional Signal ===")
-print(diag.to_string(index=False))
-
-# Highlight most recent year with all signals active
-recent = valid[valid["year"] == valid["year"].max()].iloc[0]
-n = recent["n_cust_oddlot"]
-print(f"\n--- Most recent year: {int(recent['year'])} ---")
-print(f"  Customer odd-lots:       {int(n):,}")
-print(f"  Ref-price coverage:      {recent['ref_price_cov']*100:.1f}%")
-print(f"  Flag-based rate:         {recent['inst_cust_count']*100:.1f}%")
-print(f"  SMA cluster rate:        {recent['inst_sma_count']*100:.1f}%")
-print(f"  Markup-based rate:       {recent['inst_markup_count']*100:.1f}%  (denominator: ref-price trades only)")
-print(f"  Combined rate:           {recent['inst_combined_count']*100:.1f}%")
-print(f"  MSRB 2025 benchmark:     53–67%  (2024)")
-print(f"  Signal overlap:")
-for k in ["n_only_flag","n_only_sma","n_only_markup",
-          "n_flag_sma","n_flag_markup","n_sma_markup","n_all_three","n_none"]:
-    if k in recent:
-        print(f"    {k:20s}: {int(recent[k]):>8,}  ({int(recent[k])/n*100:.1f}%)")
 
 
 """ Plots """
@@ -416,9 +403,9 @@ plt.show()
 fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
 ax.set_facecolor("white")
 ax.plot(summary_year["year"], summary_year["inst_cust_count"] * 100,
-        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Dealer flag")
-ax.plot(summary_year["year"], summary_year["inst_sma_count"] * 100,
-        color="#9467bd", linewidth=1.5, marker="o", markersize=4, label=f"Clustered trading")
+        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Flag-based")
+ax.plot(summary_year["year"], summary_year["inst_cluster_count"] * 100,
+        color="#9467bd", linewidth=1.5, marker="o", markersize=4, label="Clustering-based")
 ax.plot(summary_year["year"], summary_year["inst_markup_count"] * 100,
         color="#2ca02c", linewidth=1.5, marker="o", markersize=4, label=f"Markup-based")
 ax.plot(summary_year["year"], summary_year["inst_combined_count"] * 100,
@@ -440,9 +427,9 @@ plt.show()
 fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
 ax.set_facecolor("white")
 ax.plot(summary_year["year"], summary_year["inst_cust_vol"] * 100,
-        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Dearler flag")
-ax.plot(summary_year["year"], summary_year["inst_sma_vol"] * 100,
-        color="#9467bd", linewidth=1.5, marker="o", markersize=4, label=f"Clustered trading")
+        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Flag-based")
+ax.plot(summary_year["year"], summary_year["inst_cluster_vol"] * 100,
+        color="#9467bd", linewidth=1.5, marker="o", markersize=4, label="Clustering-based")
 ax.plot(summary_year["year"], summary_year["inst_markup_vol"] * 100,
         color="#2ca02c", linewidth=1.5, marker="o", markersize=4, label=f"Markup-based")
 ax.plot(summary_year["year"], summary_year["inst_combined_vol"] * 100,
@@ -481,7 +468,7 @@ ax.stackplot(
     sy["sh_only_sma"]    * 100,
     sy["sh_only_markup"] * 100,
     sy["sh_overlap"]     * 100,
-    labels=["Flag only (ntbc|wap)", "SMA only", "Markup only", "2+ signals overlap"],
+    labels=["Flag-based only", "Clustering-based only", "Markup-based only", "2+ signals overlap"],
     colors=["#1f77b4", "#9467bd", "#2ca02c", "#bcbd22"],
     alpha=0.80,
 )
@@ -493,119 +480,78 @@ ax.grid(True, color="lightgrey", zorder=0)
 ax.legend(fontsize=10, loc="upper left")
 plt.suptitle("Signal Decomposition: Exclusive Contribution to Combined Institutional Measure")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
-#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_decomp.pdf"), bbox_inches="tight")
+plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/signal_decomp.pdf"), bbox_inches="tight")
 plt.show()
 
 
-" Robustness 2: Ref-price coverage vs markup institutional rate "
-# If markup rate tracks ref-price coverage, the markup signal is driven by data
-# availability (which CUSIPs have D-trades) rather than economics.
-fig, ax1 = plt.subplots(figsize=(10, 4), facecolor="white")
-ax1.set_facecolor("white")
-ax2 = ax1.twinx()
-ax1.plot(sy["year"], sy["ref_price_cov"] * 100,
-         color="#7f7f7f", linewidth=1.5, marker="o", markersize=4, label="Ref-price coverage (left)")
-ax2.plot(sy["year"], sy["inst_markup_count"] * 100,
-         color="#2ca02c", linewidth=1.5, marker="s", markersize=4, label="Markup inst rate (right)")
-ax1.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
-ax1.set_xlabel("Year")
-ax1.set_ylabel("Customer odd-lots with D-trade ref price (%)", fontsize=11)
-ax2.set_ylabel("Markup institutional rate (%)", fontsize=11)
-ax1.yaxis.set_major_formatter(mtick.PercentFormatter())
-ax2.yaxis.set_major_formatter(mtick.PercentFormatter())
-ax1.grid(True, color="lightgrey")
-lines1, labels1 = ax1.get_legend_handles_labels()
-lines2, labels2 = ax2.get_legend_handles_labels()
-ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=10)
-plt.suptitle("Robustness: Markup Signal vs Ref-Price Availability")
-plt.tight_layout(rect=[0, 0, 1, 0.95])
-#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_markup_cov.pdf"), bbox_inches="tight")
-plt.show()
-
-
-" Robustness 3: Flag-based structural break check (2016 mandate) "
+" Robustness 2: Flag-based structural break check (2016 mandate) "
 # MSRB mandated NTBC/ATS reporting ~2016. The flag-based signal should show a
 # structural upward shift at 2016 if it is real institutional activity, not just
 # indicator adoption. If it jumps discontinuously, the level pre-2016 is not comparable.
 fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
 ax.set_facecolor("white")
 ax.plot(sy["year"], sy["inst_cust_count"] * 100,
-        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Flag-based (ntbc|wap)")
-ax.axvline(x=2016, color="#d62728", linewidth=1.2, linestyle="--", label="NTBC/ATS mandate (~2016)")
+        color="#1f77b4", linewidth=1.5, marker="o", markersize=4, label="Flag-based signal")
+ax.axvline(x=2016, color="#d62728", linewidth=1.2, linestyle="--", label="MSRB disclosure mandate")
 ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
 ax.set_xlabel("Year")
 ax.set_ylabel("Flag-based institutional share (%)", fontsize=11)
 ax.yaxis.set_major_formatter(mtick.PercentFormatter())
 ax.grid(True, color="lightgrey")
 ax.legend(fontsize=10)
-plt.suptitle("Robustness: Flag-Based Signal Around NTBC/ATS Mandate (2016)")
+#plt.suptitle("Robustness: Flag-Based Signal Around NTBC/ATS Mandate (2016)")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 #plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_flag_break.pdf"), bbox_inches="tight")
 plt.show()
 
 
-" Robustness 4: Combined minus best single signal (marginal gain from combining) "
-# If combined is barely above max(flag, sma, markup), combining adds little.
-# Large gap means the signals are complementary and union meaningfully expands coverage.
-sy["best_single"] = sy[["inst_cust_count", "inst_sma_count", "inst_markup_count"]].max(axis=1)
-sy["marginal_gain"] = sy["inst_combined_count"] - sy["best_single"]
+" Robustness 3: Combined signal on block trades (≥$1M) — customer, dealer, all "
+# Three panels side by side, one per segment: customer (P/S), dealer (D), all.
+# Dealer blocks are nearly 100% institutional by definition (inst_flag fires on ATS/BB),
+# providing an upper-bound anchor. Customer blocks should be mostly institutional.
+# All-trades combined gives the headline robustness figure.
+BLOCK_PLOT = [
+    ("block_cust",   "Customer (P/S) ≥$1M",  "n_block_cust"),
+    ("block_dealer", "Dealer (D) ≥$1M",      "n_block_dealer"),
+    ("block_all",    "All trades ≥$1M",       "n_block_all"),
+]
+BLOCK_SIGNALS = [
+    ("inst_flag",     "Flag-based",        "#1f77b4"),
+    ("inst_cluster",  "Clustering-based",  "#9467bd"),
+    ("inst_markup",   "Markup-based",      "#2ca02c"),
+    ("inst_combined", "Combined",          "#d62728"),
+]
 
-fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
-ax.set_facecolor("white")
-ax.plot(sy["year"], sy["inst_combined_count"] * 100,
-        color="#d62728", linewidth=1.5, marker="o", markersize=4, label="Combined")
-ax.plot(sy["year"], sy["best_single"] * 100,
-        color="#7f7f7f", linewidth=1.5, marker="o", markersize=4,
-        linestyle="--", label="Best single signal")
-ax.fill_between(sy["year"],
-                sy["best_single"] * 100, sy["inst_combined_count"] * 100,
-                color="#d62728", alpha=0.15, label="Marginal gain from combining")
-ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
-ax.set_xlabel("Year")
-ax.set_ylabel("Institutional share (%)", fontsize=11)
-ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-ax.grid(True, color="lightgrey")
-ax.legend(fontsize=10)
-plt.suptitle("Robustness: Marginal Gain of Combined Signal Over Best Single Signal")
-plt.tight_layout(rect=[0, 0, 1, 0.95])
-#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_marginal_gain.pdf"), bbox_inches="tight")
-plt.show()
+fig, axes = plt.subplots(1, 3, figsize=(18, 4), facecolor="white", sharey=True)
+for ax in axes:
+    ax.set_facecolor("white")
 
+for ax, (seg, title, n_col) in zip(axes, BLOCK_PLOT):
+    bl = sy[sy[n_col] > 0].copy()
+    for sig, lbl, color in BLOCK_SIGNALS:
+        col = f"{sig}_{seg}_count"
+        if col in bl.columns:
+            ax.plot(bl["year"], bl[col] * 100,
+                    color=color, linewidth=1.5, marker="o", markersize=4, label=lbl)
+    # reference: combined odd-lots
+    ax.plot(sy["year"], sy["inst_combined_count"] * 100,
+            color="#7f7f7f", linewidth=1.2, marker="s", markersize=3,
+            linestyle="--", alpha=0.6, label="Combined odd-lots (ref)")
+    ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
+    ax.set_xlabel("Year")
+    ax.set_title(title)
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax.grid(True, color="lightgrey")
 
-" Robustness 5: Combined signal applied to block trades (≥$1M) "
-# Block customer trades are almost certainly institutional. If the combined signal
-# is working, it should flag a large fraction of block trades — much more than
-# the ~2-3% it flags for odd-lots. The SMA component alone won't fire here (blocks
-# rarely cluster), so this checks whether inst_channel + inst_markup carry the load.
-# A high block rate (e.g. >50%) would validate the combined signal's institutional reach.
-bl = sy[sy["n_block"] > 0].copy()
-
-fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
-ax.set_facecolor("white")
-ax.plot(bl["year"], bl["inst_combined_block_count"] * 100,
-        color="#d62728", linewidth=1.5, marker="o", markersize=4, label="Combined (block ≥$1M)")
-ax.plot(bl["year"], bl["inst_channel_block_count"] * 100,
-        color="#1f77b4", linewidth=1.5, marker="o", markersize=4,
-        linestyle="--", label="Flag only (block ≥$1M)")
-ax.plot(bl["year"], bl["inst_markup_block_count"] * 100,
-        color="#2ca02c", linewidth=1.5, marker="o", markersize=4,
-        linestyle=":", label="Markup only (block ≥$1M, conditional on ref price)")
-ax.plot(sy["year"], sy["inst_combined_count"] * 100,
-        color="#7f7f7f", linewidth=1.2, marker="s", markersize=3,
-        linestyle="--", alpha=0.6, label="Combined (odd-lots ≤$100K) — reference")
-ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
-ax.set_xlabel("Year")
-ax.set_ylabel("Institutional share (%)", fontsize=11)
-ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-ax.grid(True, color="lightgrey")
-ax.legend(fontsize=10)
-plt.suptitle("Robustness: Combined Signal on Block Trades (≥$1M) vs Odd-Lots")
+axes[0].set_ylabel("Institutional share (%)", fontsize=11)
+axes[0].legend(fontsize=9)
+plt.suptitle("Robustness: Institutional Signal on Block Trades (≥$1M) by Trade Type")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 #plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_block_combined.pdf"), bbox_inches="tight")
 plt.show()
 
 
-" Robustness 6: Combined signal by par-size bucket over time "
+" Robustness 4: Combined signal by par-size bucket over time "
 # Each size bucket should show combined >> sma-only (larger buckets have better
 # ref-price coverage and may carry ntbc/wap flags). If combined is flat across
 # buckets, the markup/flag signals don't discriminate by size either.
@@ -634,18 +580,26 @@ axes[0].grid(True, color="lightgrey")
 axes[0].legend(fontsize=10, title="Par-size bucket")
 axes[0].set_title("Combined rate by size bucket (time series)")
 
-# Right: SMA vs combined bar chart for most recent year
+# Right: four-measure grouped bar chart for most recent year
 recent_yr = sy["year"].max()
 row = sy[sy["year"] == recent_yr].iloc[0]
-bucket_labels  = [d for _, d, _ in BUCKET_META]
-bucket_colors  = [c for _, _, c in BUCKET_META]
-sma_rates      = [row.get(f"inst_sma_{l}",      float("nan")) * 100 for l, _, _ in BUCKET_META]
-combined_rates = [row.get(f"inst_combined_{l}",  float("nan")) * 100 for l, _, _ in BUCKET_META]
+bucket_labels = [d for _, d, _ in BUCKET_META]
 
+MEASURES = [
+    ("inst_cluster",      "Clustering-based",   "#9467bd"),
+    ("inst_flag",  "Flag-based",         "#1f77b4"),
+    ("inst_markup",   "Markup-based",       "#2ca02c"),
+    ("inst_combined", "Combined",           "#d62728"),
+]
+n_measures = len(MEASURES)
 x = np.arange(len(BUCKET_META))
-w = 0.35
-axes[1].bar(x - w/2, sma_rates,      w, label="SMA only",  color="#9467bd", alpha=0.80)
-axes[1].bar(x + w/2, combined_rates, w, label="Combined",  color="#d62728", alpha=0.80)
+w = 0.18
+
+for i, (key, label, color) in enumerate(MEASURES):
+    rates = [row.get(f"{key}_{l}", float("nan")) * 100 for l, _, _ in BUCKET_META]
+    offset = (i - (n_measures - 1) / 2) * w
+    axes[1].bar(x + offset, rates, w, label=label, color=color, alpha=0.85)
+
 axes[1].set_xticks(x)
 axes[1].set_xticklabels(bucket_labels)
 axes[1].set_xlabel("Par-size bucket")
@@ -653,9 +607,49 @@ axes[1].set_ylabel("Institutional share (%)", fontsize=11)
 axes[1].yaxis.set_major_formatter(mtick.PercentFormatter())
 axes[1].grid(True, axis="y", color="lightgrey")
 axes[1].legend(fontsize=10)
-axes[1].set_title(f"SMA vs Combined by size bucket ({recent_yr})")
+axes[1].set_title(f"All measures by size bucket ({recent_yr})")
 
 plt.suptitle("Robustness: Combined Signal by Par-Size Bucket")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 #plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_bucket_combined.pdf"), bbox_inches="tight")
+plt.show()
+
+
+" Robustness 5: Signal specificity — customer vs dealer odd-lots "
+# inst_cluster and inst_markup are computed only on customer trades, so they
+# should be ~0 for dealer (D) odd-lots.  inst_flag (ATS/BB/NTBC/WAP) fires on
+# D trades, so it should be high.  Validating this confirms signals are not
+# accidentally picking up dealer-dealer activity.
+ROB5_SIGNALS = [
+    ("inst_flag",     "inst_cust_count",    "inst_flag_dealer_odd_count",     "Flag-based",       "#1f77b4"),
+    ("inst_cluster",  "inst_cluster_count", "inst_cluster_dealer_odd_count",  "Clustering-based", "#9467bd"),
+    ("inst_markup",   "inst_markup_count",  "inst_markup_dealer_odd_count",   "Markup-based",     "#2ca02c"),
+    ("inst_combined", "inst_combined_count","inst_combined_dealer_odd_count", "Combined",         "#d62728"),
+]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4), facecolor="white", sharey=False)
+for ax in axes:
+    ax.set_facecolor("white")
+
+for _, cust_col, dealer_col, lbl, color in ROB5_SIGNALS:
+    axes[0].plot(sy["year"], sy[cust_col] * 100,
+                 color=color, linewidth=1.5, marker="o", markersize=4, label=lbl)
+    if dealer_col in sy.columns:
+        axes[1].plot(sy["year"], sy[dealer_col] * 100,
+                     color=color, linewidth=1.5, marker="o", markersize=4, label=lbl)
+
+for ax, title in zip(axes, ["Customer odd-lots (P/S, par ≤$100K)",
+                              "Dealer odd-lots (D, par ≤$100K)"]):
+    ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Signal rate (%)", fontsize=11)
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax.grid(True, color="lightgrey")
+    ax.legend(fontsize=10)
+    ax.set_title(title)
+
+plt.suptitle("Robustness: Signal Specificity — Customer vs Dealer Odd-Lots\n"
+             "(Clustering- and Markup-based signals should be ~0 for dealer trades)")
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_dealer_specificity.pdf"), bbox_inches="tight")
 plt.show()
