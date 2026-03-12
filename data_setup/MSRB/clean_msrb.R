@@ -5,7 +5,7 @@
 # ------------
 #   This file cleans the MSRB transaction data from 2005 till now.
 #   Conditional on:
-#   (1) cusips with > 10 trades across 2005 till 2025
+#   (1) cusips with >= 3 trades across 2005 till 2025
 #
 # Output(s):
 # ------------
@@ -120,7 +120,7 @@ t_lowtrade <- total_counts[counts < 3]
 cusipno <- nrow(t_lowtrade)
 
 # save down low trade cusips
-message(sprintf("Total # CUSIPs with <=10 trades across 2005-2025: %d", cusipno))  # 813090
+message(sprintf("Total # CUSIPs with < 3 trades across 2005-2025: %d", cusipno))
 saveRDS(t_lowtrade, paste0(TEMPDIR, "MSRB/cusip_less_than_3.rds"))
 
 # for fast anti-join later:
@@ -160,7 +160,7 @@ for (k in seq_along(years)) {
   
   ## --- Step 1.1: business days + non-holidays ---
   # Convert trade_date
-  if (!"trade_date" %in% names(dt)) stop(sprintf("Missing 'trade_date' in %s", fn))
+  if (!"trade_date" %in% names(dt)) stop(sprintf("Missing 'trade_date' in msrb_%d.rds", year))
   dt[, trade_date := as.IDate(trade_date)]  # expects YYYY-mm-dd; adjust if needed
   bd <- get_business_days(year)
   message(sprintf("Business days in %d (ex-holidays): %d", year, nrow(bd)))
@@ -175,7 +175,7 @@ for (k in seq_along(years)) {
   starting_rows <- new_rows
   
   ## --- Step 1.2: compute time-to-maturity ---
-  if (!"maturity_date" %in% names(dt)) stop(sprintf("Missing 'maturity_date' in %s", fn))
+  if (!"maturity_date" %in% names(dt)) stop(sprintf("Missing 'maturity_date' in msrb_%d.rds", year))
   dt[, maturity_date := as.IDate(maturity_date)]  # invalid -> NA
   
   dt <- dt[!is.na(maturity_date) & !is.na(trade_date)]
@@ -192,7 +192,7 @@ for (k in seq_along(years)) {
   ## --- Step 1.3: numeric cols + drop NA ---
   need_num <- c("dollar_price", "coupon", "yield", "par_traded")
   miss <- setdiff(need_num, names(dt))
-  if (length(miss)) stop(sprintf("Missing numeric cols in %s: %s", fn, paste(miss, collapse = ", ")))
+  if (length(miss)) stop(sprintf("Missing numeric cols in msrb_%d.rds: %s", year, paste(miss, collapse = ", ")))
   
   for (v in need_num) {
     suppressWarnings(dt[, (v) := as.numeric(get(v))])
@@ -274,7 +274,7 @@ for (k in seq_along(years)) {
     year = trade_year[1L],
     num_cusip        = uniqueN(cusip),
     num_trade        = .N,
-    num_trade_retail = sum(par_traded < 100000, na.rm = TRUE),
+    num_trade_retail = sum(par_traded <= 100000, na.rm = TRUE),
     
     totparamt = sum(par_traded, na.rm = TRUE) / 1e9,
     paramt_D  = sum(par_traded[trade_type_indicator == "D"], na.rm = TRUE) / 1e9,
@@ -307,8 +307,8 @@ p1 <- ggplot(sum, aes(x = year, y = share_retail)) +
   geom_line(linewidth = 1, color = "steelblue") +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   scale_x_continuous(
-    breaks = seq(min(plot_dt$year, na.rm = TRUE),
-                 max(plot_dt$year, na.rm = TRUE),
+    breaks = seq(min(sum$year, na.rm = TRUE),
+                 max(sum$year, na.rm = TRUE),
                  by = 2)
   ) +
   labs(
