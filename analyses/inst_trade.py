@@ -202,7 +202,7 @@ for y in tqdm(years):
     inst_cust_count = _count_share(cust_odd, "inst_channel")
     inst_cust_vol   = _vol_share(cust_odd,   "inst_channel")
 
-    # SMA-cluster (all customer odd-lots)
+    # SMA-cluster (customer odd-lots)
     inst_sma_count = _count_share(cust_odd,  "inst_sma")
     inst_sma_vol   = _vol_share(cust_odd,    "inst_sma")
 
@@ -244,7 +244,7 @@ for y in tqdm(years):
         f"None: {overlap['n_none']/n_co*100:.1f}%"
     )
 
-    # P vs S SMA split (customer odd-lots)
+    # P vs S split (customer odd-lots)
     cust_odd_P = dt[dt["odd_lot"] & (dt["trade_type_indicator"] == "P")]
     cust_odd_S = dt[dt["odd_lot"] & (dt["trade_type_indicator"] == "S")]
     inst_sma_P_count = _count_share(cust_odd_P, "inst_sma")
@@ -257,14 +257,25 @@ for y in tqdm(years):
         ("25_50k",  25_000,  50_000),
         ("50_100k", 50_000, 100_000),
     ]
-    sma_by_bucket = {}
+    stats_by_bucket = {}
     for label, lo, hi in SIZE_BUCKETS:
-        bkt = cust_odd[(cust_odd["par_traded"] > lo) & (cust_odd["par_traded"] <= hi)]
-        sma_by_bucket[f"inst_sma_{label}"] = _count_share(bkt, "inst_sma")
+        bkt     = cust_odd[(cust_odd["par_traded"] > lo) & (cust_odd["par_traded"] <= hi)]
+        bkt_ref = bkt[bkt["ref_price"].notna()]
+        stats_by_bucket[f"inst_sma_{label}"]      = _count_share(bkt,     "inst_sma")
+        stats_by_bucket[f"inst_channel_{label}"]  = _count_share(bkt,     "inst_channel")
+        stats_by_bucket[f"inst_markup_{label}"]   = _count_share(bkt_ref, "inst_markup")
+        stats_by_bucket[f"inst_combined_{label}"] = _count_share(bkt,     "inst_combined")
 
-    # Block-trade SMA calibration: ≥$1M customer trades should be nearly all institutional
+    # Block-trade combined signal calibration: ≥$1M customer trades should be
+    # nearly all institutional. Combined should outperform SMA alone here since
+    # large CUSIPs are more liquid (higher ref_price coverage) and may carry NTBC/WAP flags.
     block = dt[dt["customer_trade"] & (dt["par_traded"] >= 1_000_000)]
-    inst_sma_block_count = _count_share(block, "inst_sma")
+    block_ref = block[block["ref_price"].notna()]
+    inst_sma_block_count      = _count_share(block,     "inst_sma")
+    inst_channel_block_count  = _count_share(block,     "inst_channel")
+    inst_markup_block_count   = _count_share(block_ref, "inst_markup")
+    inst_combined_block_count = _count_share(block,     "inst_combined")
+    ref_cov_block = len(block_ref) / len(block) if len(block) > 0 else float("nan")
     n_block = len(block)
 
     results.append({
@@ -275,31 +286,36 @@ for y in tqdm(years):
         "par_total_bn":          par_total       / 1e9,
         "par_oddlot_bn":         par_oddlot      / 1e9,
         "par_cust_oddlot_bn":    par_cust_oddlot / 1e9,
-        # flag-based (ntbc|wap only meaningful for customer trades)
+        # flag-based
         "inst_all_count":        inst_all_count,
         "inst_all_vol":          inst_all_vol,
         "inst_cust_count":       inst_cust_count,
         "inst_cust_vol":         inst_cust_vol,
-        # SMA clustering (customer odd-lots)
+        # SMA clustering
         "inst_sma_count":        inst_sma_count,
         "inst_sma_vol":          inst_sma_vol,
-        # markup-based (customer odd-lots with ref price)
+        # markup-based
         "inst_markup_count":     inst_markup_count,
         "inst_markup_vol":       inst_markup_vol,
         # combined: flag | sma | markup
         "inst_combined_count":   inst_combined_count,
         "inst_combined_vol":     inst_combined_vol,
+
         # ref-price coverage and signal overlap
         "ref_price_cov":         ref_cov,
         **{k: v for k, v in overlap.items()},
         # P vs S SMA split
         "inst_sma_P_count":      inst_sma_P_count,
         "inst_sma_S_count":      inst_sma_S_count,
-        # size-bucket SMA
-        **sma_by_bucket,
-        # block-trade calibration
-        "inst_sma_block_count":  inst_sma_block_count,
-        "n_block":               n_block,
+        # size-bucket signals (sma, channel, markup, combined)
+        **stats_by_bucket,
+        # block-trade calibration (≥$1M customer trades)
+        "inst_sma_block_count":      inst_sma_block_count,
+        "inst_channel_block_count":  inst_channel_block_count,
+        "inst_markup_block_count":   inst_markup_block_count,
+        "inst_combined_block_count": inst_combined_block_count,
+        "ref_cov_block":             ref_cov_block,
+        "n_block":                   n_block,
     })
 
     del dt
@@ -554,4 +570,93 @@ ax.legend(fontsize=10)
 plt.suptitle("Robustness: Marginal Gain of Combined Signal Over Best Single Signal")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 #plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_marginal_gain.pdf"), bbox_inches="tight")
+plt.show()
+
+
+" Robustness 5: Combined signal applied to block trades (≥$1M) "
+# Block customer trades are almost certainly institutional. If the combined signal
+# is working, it should flag a large fraction of block trades — much more than
+# the ~2-3% it flags for odd-lots. The SMA component alone won't fire here (blocks
+# rarely cluster), so this checks whether inst_channel + inst_markup carry the load.
+# A high block rate (e.g. >50%) would validate the combined signal's institutional reach.
+bl = sy[sy["n_block"] > 0].copy()
+
+fig, ax = plt.subplots(figsize=(10, 4), facecolor="white")
+ax.set_facecolor("white")
+ax.plot(bl["year"], bl["inst_combined_block_count"] * 100,
+        color="#d62728", linewidth=1.5, marker="o", markersize=4, label="Combined (block ≥$1M)")
+ax.plot(bl["year"], bl["inst_channel_block_count"] * 100,
+        color="#1f77b4", linewidth=1.5, marker="o", markersize=4,
+        linestyle="--", label="Flag only (block ≥$1M)")
+ax.plot(bl["year"], bl["inst_markup_block_count"] * 100,
+        color="#2ca02c", linewidth=1.5, marker="o", markersize=4,
+        linestyle=":", label="Markup only (block ≥$1M, conditional on ref price)")
+ax.plot(sy["year"], sy["inst_combined_count"] * 100,
+        color="#7f7f7f", linewidth=1.2, marker="s", markersize=3,
+        linestyle="--", alpha=0.6, label="Combined (odd-lots ≤$100K) — reference")
+ax.xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
+ax.set_xlabel("Year")
+ax.set_ylabel("Institutional share (%)", fontsize=11)
+ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+ax.grid(True, color="lightgrey")
+ax.legend(fontsize=10)
+plt.suptitle("Robustness: Combined Signal on Block Trades (≥$1M) vs Odd-Lots")
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_block_combined.pdf"), bbox_inches="tight")
+plt.show()
+
+
+" Robustness 6: Combined signal by par-size bucket over time "
+# Each size bucket should show combined >> sma-only (larger buckets have better
+# ref-price coverage and may carry ntbc/wap flags). If combined is flat across
+# buckets, the markup/flag signals don't discriminate by size either.
+BUCKET_META = [
+    ("0_15k",   "$0–15K",   "#1f77b4"),
+    ("15_25k",  "$15–25K",  "#ff7f0e"),
+    ("25_50k",  "$25–50K",  "#2ca02c"),
+    ("50_100k", "$50–100K", "#d62728"),
+]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4), facecolor="white")
+for ax in axes:
+    ax.set_facecolor("white")
+
+# Left: combined rate by bucket over time
+for label, display, color in BUCKET_META:
+    col = f"inst_combined_{label}"
+    if col in sy.columns:
+        axes[0].plot(sy["year"], sy[col] * 100,
+                     color=color, linewidth=1.5, marker="o", markersize=4, label=display)
+axes[0].xaxis.set_major_locator(mtick.MaxNLocator(integer=True))
+axes[0].set_xlabel("Year")
+axes[0].set_ylabel("Combined institutional share (%)", fontsize=11)
+axes[0].yaxis.set_major_formatter(mtick.PercentFormatter())
+axes[0].grid(True, color="lightgrey")
+axes[0].legend(fontsize=10, title="Par-size bucket")
+axes[0].set_title("Combined rate by size bucket (time series)")
+
+# Right: SMA vs combined bar chart for most recent year
+recent_yr = sy["year"].max()
+row = sy[sy["year"] == recent_yr].iloc[0]
+bucket_labels  = [d for _, d, _ in BUCKET_META]
+bucket_colors  = [c for _, _, c in BUCKET_META]
+sma_rates      = [row.get(f"inst_sma_{l}",      float("nan")) * 100 for l, _, _ in BUCKET_META]
+combined_rates = [row.get(f"inst_combined_{l}",  float("nan")) * 100 for l, _, _ in BUCKET_META]
+
+x = np.arange(len(BUCKET_META))
+w = 0.35
+axes[1].bar(x - w/2, sma_rates,      w, label="SMA only",  color="#9467bd", alpha=0.80)
+axes[1].bar(x + w/2, combined_rates, w, label="Combined",  color="#d62728", alpha=0.80)
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(bucket_labels)
+axes[1].set_xlabel("Par-size bucket")
+axes[1].set_ylabel("Institutional share (%)", fontsize=11)
+axes[1].yaxis.set_major_formatter(mtick.PercentFormatter())
+axes[1].grid(True, axis="y", color="lightgrey")
+axes[1].legend(fontsize=10)
+axes[1].set_title(f"SMA vs Combined by size bucket ({recent_yr})")
+
+plt.suptitle("Robustness: Combined Signal by Par-Size Bucket")
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+#plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_bucket_combined.pdf"), bbox_inches="tight")
 plt.show()
