@@ -30,7 +30,7 @@ Institutional signals
   Markup-based (Harris & Piwowar 2006; Green, Hollifield & Schürhoff 2007):
     ref_price   = median dollar_price of same-CUSIP same-day inter-dealer (D) trades
     markup      = |customer_price - ref_price| / ref_price
-    inst_markup = markup < MARKUP_THRESH  (default: 10 bps)
+    inst_markup = markup < MARKUP_THRESH  (default: 20 bps)
     Only defined for customer trades with at least one same-day D trade.
 
   Combined:
@@ -58,7 +58,7 @@ import matplotlib.ticker as mtick
 from tqdm import tqdm
 from utils.set_paths import PROC_DIR, OUT_DIR
 
-MARKUP_THRESH  = 0.0010   # 10 basis points
+MARKUP_THRESH  = 0.0020   # 20 basis points
 SMA_MIN_TRADES = 3        # min same-direction customer trades on same CUSIP-date → SMA cluster
 
 logfile = os.path.join(PROC_DIR, "MSRB", "institutionalization_log.txt")
@@ -206,15 +206,15 @@ for y in tqdm(years):
     inst_sma_count = _count_share(cust_odd,  "inst_sma")
     inst_sma_vol   = _vol_share(cust_odd,    "inst_sma")
 
-    # markup-based (customer odd-lots with ref price)
-    cust_odd_ref = cust_odd[cust_odd["ref_price"].notna()]
-    inst_markup_count = _count_share(cust_odd_ref, "inst_markup")
-    inst_markup_vol   = _vol_share(cust_odd_ref,   "inst_markup")
+    # markup-based (all customer odd-lots; inst_markup is False where ref_price is missing,
+    # so the rate reflects both signal strength and ref-price coverage)
+    cust_odd_ref = cust_odd[cust_odd["ref_price"].notna()]   # kept for ref_cov and diagnostics
+    inst_markup_count = _count_share(cust_odd, "inst_markup")
+    inst_markup_vol   = _vol_share(cust_odd,   "inst_markup")
 
-    # combined (all customer odd-lots; inst_markup is already False where ref_price is missing,
-    # so restricting denominator to cust_odd_ref would bias toward liquid CUSIPs)
-    inst_combined_count = _count_share(cust_odd,   "inst_combined")
-    inst_combined_vol   = _vol_share(cust_odd,     "inst_combined")
+    # combined: same denominator as all other signals
+    inst_combined_count = _count_share(cust_odd, "inst_combined")
+    inst_combined_vol   = _vol_share(cust_odd,   "inst_combined")
 
     # Ref-price coverage (customer odd-lots)
     ref_cov = len(cust_odd_ref) / len(cust_odd) if len(cust_odd) > 0 else float("nan")
@@ -259,22 +259,21 @@ for y in tqdm(years):
     ]
     stats_by_bucket = {}
     for label, lo, hi in SIZE_BUCKETS:
-        bkt     = cust_odd[(cust_odd["par_traded"] > lo) & (cust_odd["par_traded"] <= hi)]
-        bkt_ref = bkt[bkt["ref_price"].notna()]
-        stats_by_bucket[f"inst_sma_{label}"]      = _count_share(bkt,     "inst_sma")
-        stats_by_bucket[f"inst_channel_{label}"]  = _count_share(bkt,     "inst_channel")
-        stats_by_bucket[f"inst_markup_{label}"]   = _count_share(bkt_ref, "inst_markup")
-        stats_by_bucket[f"inst_combined_{label}"] = _count_share(bkt,     "inst_combined")
+        bkt = cust_odd[(cust_odd["par_traded"] > lo) & (cust_odd["par_traded"] <= hi)]
+        stats_by_bucket[f"inst_sma_{label}"]      = _count_share(bkt, "inst_sma")
+        stats_by_bucket[f"inst_channel_{label}"]  = _count_share(bkt, "inst_channel")
+        stats_by_bucket[f"inst_markup_{label}"]   = _count_share(bkt, "inst_markup")
+        stats_by_bucket[f"inst_combined_{label}"] = _count_share(bkt, "inst_combined")
 
     # Block-trade combined signal calibration: ≥$1M customer trades should be
     # nearly all institutional. Combined should outperform SMA alone here since
     # large CUSIPs are more liquid (higher ref_price coverage) and may carry NTBC/WAP flags.
     block = dt[dt["customer_trade"] & (dt["par_traded"] >= 1_000_000)]
-    block_ref = block[block["ref_price"].notna()]
-    inst_sma_block_count      = _count_share(block,     "inst_sma")
-    inst_channel_block_count  = _count_share(block,     "inst_channel")
-    inst_markup_block_count   = _count_share(block_ref, "inst_markup")
-    inst_combined_block_count = _count_share(block,     "inst_combined")
+    block_ref = block[block["ref_price"].notna()]   # kept for ref_cov_block
+    inst_sma_block_count      = _count_share(block, "inst_sma")
+    inst_channel_block_count  = _count_share(block, "inst_channel")
+    inst_markup_block_count   = _count_share(block, "inst_markup")
+    inst_combined_block_count = _count_share(block, "inst_combined")
     ref_cov_block = len(block_ref) / len(block) if len(block) > 0 else float("nan")
     n_block = len(block)
 
