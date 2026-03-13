@@ -1,54 +1,62 @@
 """
-inst_trade.py
-Compute institutionalization of municipal bond trades from MSRB clean files.
+inst_odd_lot.py
+Compute institutionalization of municipal bond odd-lot customer trades from MSRB
+clean files (WRDS). Produces year-level, state-level, and issuer-level output files.
 
 Definitions
 -----------
 - Odd lot:        par_traded <= 100,000
 - Customer trade: trade_type_indicator in {"P", "S"}
 - Dealer trade:   trade_type_indicator == "D"
+- Issuer ID:      muni_issuer_id = state abbrev for state-level issuers;
+                  state_countyFIPS for county/local issuers (matched via cusip6)
 
 Institutional signals
 ---------------------
-  Flag-based (lower bound, customer odd-lots only):
-    NOTE: ATS and BB are inter-dealer (D) only fields — always null on customer
-    trades (P/S), so inst_flag for customer trades reduces to ntbc | wap.
+  Flag-based (inst_flag):
+    Binary indicators reported by MSRB. ATS and BB are inter-dealer (D) fields
+    only — always null on customer trades — so inst_flag for customer odd-lots
+    reduces to NTBC | WAP.
     ATS:   ats_indicator == "Y"                   [D trades only]
     BB:    brokers_broker_indicator in {"P","S"}  [D trades only]
-    NTBC:  ntbc_indicator == "Y"                  [customer trades; no markup charged → institutional]
+    NTBC:  ntbc_indicator == "Y"                  [no markup charged → institutional]
     WAP:   weighted_price_indicator == "Y"        [averaged/systematic pricing → institutional]
     inst_flag = any of the above
 
-  SMA clustering (Bagley & Vieira, MSRB 2025):
-    SMAs rebalance across many client accounts simultaneously, producing clusters
-    of same-direction customer trades on the same CUSIP-date that retail investors
-    almost never generate.
-    cluster_ct  = count of same (cusip, trade_date, trade_type_indicator, trade_hour) customer trades
-                  trade_hour = floor(time_of_trade_seconds / 3600)
-    inst_cluster    = cluster_ct >= SMA_MIN_TRADES  (default: 3)
+  SMA clustering (inst_cluster; Bagley & Vieira, MSRB 2025):
+    SMAs rebalance across many client accounts simultaneously, generating clusters
+    of same-direction customer trades on the same CUSIP within a short window that
+    retail investors almost never produce.
+    trade_hour  = floor(time_of_trade_seconds / TRADE_HOUR_GAP)  (3-hour buckets)
+    cluster_ct  = count of customer trades sharing (cusip, trade_date,
+                  trade_type_indicator, trade_hour)
+    inst_cluster = cluster_ct >= SMA_MIN_TRADES  (default: 3)
 
-  Markup-based (Harris & Piwowar 2006; Green, Hollifield & Schürhoff 2007):
-    ref_price   = median dollar_price of D trades for same CUSIP within 1 calendar day
-                  (date-1, date, date+1 pooled together)
-    markup      = |customer_price - ref_price| / ref_price
+  Markup-based (inst_markup; Harris & Piwowar 2006; Green, Hollifield & Schürhoff 2007):
+    ref_price   = median dollar_price of D trades for the same CUSIP within 1
+                  calendar day (date−1, date, date+1 pooled)
+    markup      = |customer_price − ref_price| / ref_price
     inst_markup = markup < MARKUP_THRESH  (default: 30 bps)
-    Only defined for customer trades with at least one D-trade within the 1-day window.
+    Only defined for customer trades with at least one D-trade in the ±1-day window.
 
-  Combined:
+  Combined (inst_combined):
     inst_combined = inst_flag | inst_cluster | inst_markup
-    (markup component requires a valid ref_price)
+
+Output files
+------------
+  inst_oddlot_year.csv  — year-level aggregate statistics
+  inst_oddlot_sy.csv    — year × state institutional share
+  inst_oddlot_iy.csv    — year × muni_issuer_id institutional share
+  inst_oddlot_sm.csv    — month × state institutional share
+  inst_oddlot_im.csv    — month × muni_issuer_id institutional share
 
 Data availability notes
--------------------------------------------------
-- 2005–2010: All indicator fields (ATS, NTBC, BB) are entirely null — MSRB did
-  not collect them in early years. inst_flag = 0 for these years by design.
-- BB (brokers_broker_indicator) first appears in ~2012.
-- ATS and NTBC first appear in ~2016 when MSRB mandated their reporting.
-- 2005–2011 data contains only customer (P/S) trades — no inter-dealer (D) trades
-  are present in the WRDS export. This means ref_price is undefined and
+-----------------------
+- 2005–2010: ATS, NTBC, BB are entirely null; inst_flag = 0 by design.
+- BB first appears ~2012; ATS and NTBC first appear ~2016 (MSRB mandate).
+- 2005–2011: no inter-dealer (D) trades in WRDS export → ref_price undefined,
   inst_markup = 0 for those years.
-- inst_cluster (SMA clustering) is the only signal available across the full 2005–2025
-  window and is the primary vehicle for tracking institutionalization trends over time.
+- inst_cluster is the only signal spanning the full 2005–2025 window.
 """
 
 import pandas as pd
@@ -57,10 +65,11 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 from tqdm import tqdm
-from utils.set_paths import PROC_DIR, OUT_DIR
+from utils.set_paths import PROC_DIR, OUT_DIR, RAW_DIR
 
 MARKUP_THRESH  = 0.0030   # 30 basis points
 SMA_MIN_TRADES = 3        # min same-direction customer trades on same CUSIP-date → SMA cluster
+TRADE_HOUR_GAP = 3600 * 3 # time bucket width in seconds (3 hours)
 
 logfile = os.path.join(PROC_DIR, "MSRB", "institutionalization_log.txt")
 with open(logfile, "w") as f:
@@ -71,6 +80,10 @@ def log(msg):
     print(line)
     with open(logfile, "a") as f:
         f.write(line + "\n")
+
+# Location: cusip_county_info on cusip6 
+cty = pd.read_csv(f"{RAW_DIR}/cusip_county_info.csv", dtype={"cusip6": str})
+print("Read muni issuer location:", cty.shape)
 
 
 """ Compute institutionalization """
@@ -84,6 +97,10 @@ USECOLS = [
 
 years = range(2005, 2026)
 results = []
+geo_state_results        = []
+geo_issuer_results       = []
+geo_state_month_results  = []
+geo_issuer_month_results = []
 
 log(f"START institutionalization loop. Years: {min(years)}-{max(years)}")
 
@@ -138,7 +155,7 @@ for y in tqdm(years):
     # tightens the signal: retail investors almost never generate ≥ SMA_MIN_TRADES
     # same-direction trades on the same bond within the same hour.
     # time_of_trade is in seconds since midnight; floor to hour bucket.
-    dt["trade_hour"] = pd.to_numeric(dt["time_of_trade"], errors="coerce") // 3600
+    dt["trade_hour"] = pd.to_numeric(dt["time_of_trade"], errors="coerce") // TRADE_HOUR_GAP
     cust_mask = dt["customer_trade"]
     dt["inst_cluster"] = False
     if cust_mask.sum() > 0:
@@ -343,12 +360,104 @@ for y in tqdm(years):
         **dealer_odd_stats,
     })
 
-    del dt
+    " Geography-level measures "
+    # attach issuer state / municipality to MSRB trades
+    dt["cusip6"] = dt["cusip"].str[:6]
+    dt_geo = pd.merge(dt, cty[["cusip6", "state", "fips_state", "county_fips"]],
+                      on="cusip6", how="left")
+
+    # Keep only trades with at least a state match; build muni_issuer_id
+    dt_geo = dt_geo.loc[
+        dt_geo["county_fips"].notnull() | dt_geo["fips_state"].notnull()
+    ].copy()
+    is_state = dt_geo["county_fips"].isnull()
+    dt_geo.loc[is_state,  "muni_issuer_id"] = dt_geo.loc[is_state, "state"]
+    dt_geo.loc[~is_state, "muni_issuer_id"] = (
+        dt_geo.loc[~is_state, "state"] + "_" +
+        dt_geo.loc[~is_state, "county_fips"].astype(float).astype(int).astype(str)
+    )
+
+    # Customer odd-lots with valid geography — base for geo-level inst share
+    geo_odd = dt_geo[
+        dt_geo["odd_lot"] & dt_geo["customer_trade"] & dt_geo["muni_issuer_id"].notna()
+    ].copy()
+    geo_odd["par_inst"]    = geo_odd["par_traded"] * geo_odd["inst_combined"]
+    geo_odd["n_inst"]      = geo_odd["inst_combined"].astype(int)
+    geo_odd["trade_month"] = geo_odd["trade_date"].dt.to_period("M").astype(str)
+
+    def _geo_agg(df, group_cols):
+        g = (df.groupby(group_cols)
+               .agg(n_cust_oddlot    =("par_traded", "count"),
+                    n_inst_combined  =("n_inst",     "sum"),
+                    par_cust_oddlot  =("par_traded", "sum"),
+                    par_inst_combined=("par_inst",   "sum"))
+               .reset_index())
+        g["inst_share_vol"]   = g["par_inst_combined"] / g["par_cust_oddlot"]
+        g["inst_share_count"] = g["n_inst_combined"]   / g["n_cust_oddlot"]
+        return g
+
+    if len(geo_odd) > 0:
+        # Annual — state
+        st = _geo_agg(geo_odd, ["state", "fips_state"])
+        st["year"] = y
+        geo_state_results.append(st)
+
+        # Annual — issuer
+        iss = _geo_agg(geo_odd, ["muni_issuer_id", "state", "fips_state", "county_fips"])
+        iss["year"] = y
+        geo_issuer_results.append(iss)
+
+        # Monthly — state
+        stm = _geo_agg(geo_odd, ["state", "fips_state", "trade_month"])
+        geo_state_month_results.append(stm)
+
+        # Monthly — issuer
+        ism = _geo_agg(geo_odd, ["muni_issuer_id", "state", "fips_state", "county_fips", "trade_month"])
+        geo_issuer_month_results.append(ism)
+
+    del dt, dt_geo, geo_odd
     log(f"Year {y} done.")
 
 summary_year = pd.DataFrame(results)
-summary_year.to_csv(os.path.join(PROC_DIR, "MSRB/oddlot_sum_year.csv"), index=False)
+summary_year.to_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_year.csv"), index=False)
 log("Saved summary_year.")
+
+# Geography-level institutional share (combined measure, customer odd-lots, vol-weighted)
+if geo_state_results:
+    geo_state = pd.concat(geo_state_results, ignore_index=True)
+    geo_state = geo_state[["year", "state", "fips_state",
+                            "n_cust_oddlot", "n_inst_combined",
+                            "par_cust_oddlot", "par_inst_combined",
+                            "inst_share_vol", "inst_share_count"]]
+    geo_state.to_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_sy.csv"), index=False)
+    log(f"Saved inst_combined_state: {geo_state.shape}")
+
+if geo_issuer_results:
+    geo_issuer = pd.concat(geo_issuer_results, ignore_index=True)
+    geo_issuer = geo_issuer[["year", "muni_issuer_id", "state", "fips_state", "county_fips",
+                              "n_cust_oddlot", "n_inst_combined",
+                              "par_cust_oddlot", "par_inst_combined",
+                              "inst_share_vol", "inst_share_count"]]
+    geo_issuer.to_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_iy.csv"), index=False)
+    log(f"Saved inst_combined_issuer: {geo_issuer.shape}")
+
+if geo_state_month_results:
+    geo_state_m = pd.concat(geo_state_month_results, ignore_index=True)
+    geo_state_m = geo_state_m[["trade_month", "state", "fips_state",
+                                "n_cust_oddlot", "n_inst_combined",
+                                "par_cust_oddlot", "par_inst_combined",
+                                "inst_share_vol", "inst_share_count"]]
+    geo_state_m.to_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_sm.csv"), index=False)
+    log(f"Saved inst_oddlot_sm (monthly state): {geo_state_m.shape}")
+
+if geo_issuer_month_results:
+    geo_issuer_m = pd.concat(geo_issuer_month_results, ignore_index=True)
+    geo_issuer_m = geo_issuer_m[["trade_month", "muni_issuer_id", "state", "fips_state", "county_fips",
+                                  "n_cust_oddlot", "n_inst_combined",
+                                  "par_cust_oddlot", "par_inst_combined",
+                                  "inst_share_vol", "inst_share_count"]]
+    geo_issuer_m.to_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_im.csv"), index=False)
+    log(f"Saved inst_oddlot_im (monthly issuer): {geo_issuer_m.shape}")
 
 
 """ Plots """
@@ -444,6 +553,117 @@ ax.legend(fontsize=10)
 #plt.suptitle("Institutionalization of Odd-Lot Customer Trades (Par Volume)")
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/inst_trade_vol_ts.pdf"), bbox_inches="tight")
+plt.show()
+
+
+" Geography coverage check: state-month geo vs full MSRB sample "
+sm = pd.read_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_sm.csv"))
+yr = pd.read_csv(os.path.join(PROC_DIR, "MSRB/inst_oddlot_year.csv"))
+
+# Aggregate state-month geo data to year
+sm["year"] = pd.to_datetime(sm["trade_month"]).dt.year
+geo_yr = (sm.groupby("year")
+            .agg(geo_n_cust_oddlot =("n_cust_oddlot",  "sum"),
+                 geo_par_cust_oddlot=("par_cust_oddlot", "sum"))
+            .reset_index())
+
+# Merge with full-sample year totals
+cov = pd.merge(yr[["year", "n_cust_oddlot", "par_cust_oddlot_bn"]], geo_yr, on="year", how="left")
+cov["par_cust_oddlot_full"] = cov["par_cust_oddlot_bn"] * 1e9
+cov["cov_count"] = cov["geo_n_cust_oddlot"]    / cov["n_cust_oddlot"]
+cov["cov_vol"]   = cov["geo_par_cust_oddlot"]   / cov["par_cust_oddlot_full"]
+
+print("\nGeography coverage vs full MSRB customer odd-lot sample:")
+print(cov[["year", "n_cust_oddlot", "geo_n_cust_oddlot", "cov_count",
+           "par_cust_oddlot_bn", "geo_par_cust_oddlot", "cov_vol"]]
+      .to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+# Plot coverage over time
+fig, axes = plt.subplots(1, 2, figsize=(13, 4), facecolor="white")
+for ax in axes:
+    ax.set_facecolor("white")
+
+axes[0].plot(cov["year"], cov["cov_count"] * 100,
+             color="#1f77b4", linewidth=1.5, marker="o", markersize=4)
+axes[0].set_ylabel("Coverage (%)", fontsize=11)
+axes[0].set_xlabel("Year")
+axes[0].set_title("Trade count matched to geography")
+axes[0].yaxis.set_major_formatter(mtick.PercentFormatter())
+axes[0].grid(True, color="lightgrey")
+
+axes[1].plot(cov["year"], cov["cov_vol"] * 100,
+             color="#2ca02c", linewidth=1.5, marker="o", markersize=4)
+axes[1].set_ylabel("Coverage (%)", fontsize=11)
+axes[1].set_xlabel("Year")
+axes[1].set_title("Par volume matched to geography")
+axes[1].yaxis.set_major_formatter(mtick.PercentFormatter())
+axes[1].grid(True, color="lightgrey")
+
+plt.suptitle("Geography Match Rate: State-Level vs Full MSRB Customer Odd-Lot Sample")
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.show()
+
+
+" State-quarter institutional share time series (2 × 1: vol share, count share) "
+# Aggregate monthly file to quarterly by re-summing numerators and denominators
+sm["date_q"] = pd.to_datetime(sm["trade_month"]).dt.to_period("Q")
+sq = (sm.groupby(["state", "date_q"])
+        .agg(par_inst_combined=("par_inst_combined", "sum"),
+             par_cust_oddlot  =("par_cust_oddlot",   "sum"),
+             n_inst_combined  =("n_inst_combined",    "sum"),
+             n_cust_oddlot    =("n_cust_oddlot",      "sum"))
+        .reset_index())
+sq["inst_share_vol"]   = sq["par_inst_combined"] / sq["par_cust_oddlot"]
+sq["inst_share_count"] = sq["n_inst_combined"]   / sq["n_cust_oddlot"]
+sq["date"] = sq["date_q"].dt.to_timestamp()
+sq = sq[sq["date_q"] > "2007Q4"]
+
+# Top-5 states by total customer odd-lot par volume (post-2007Q4 only)
+top5_par   = sq.groupby("state")["par_cust_oddlot"].sum().nlargest(5)
+top5_st    = set(top5_par.index)
+TOP5_COLORS = ["#fc8d59", "#feb24c", "#78c679", "#c994c7", "#bf812d"]
+top5_color  = {s: c for s, c in zip(top5_par.index, TOP5_COLORS)}
+
+# National average per quarter: par-weighted for vol, count-weighted for count
+nat = (sq.groupby("date")
+         .agg(par_inst=("par_inst_combined", "sum"),
+              par_tot  =("par_cust_oddlot",  "sum"),
+              n_inst   =("n_inst_combined",   "sum"),
+              n_tot    =("n_cust_oddlot",     "sum"))
+         .reset_index())
+nat["nat_vol"]   = nat["par_inst"] / nat["par_tot"]
+nat["nat_count"] = nat["n_inst"]   / nat["n_tot"]
+
+PANELS = [
+    ("inst_share_vol",   "nat_vol",   "Odd-Lots Institutional share: volume (%)"),
+    ("inst_share_count", "nat_count", "Odd-Lots Institutional share: count (%)"),
+]
+
+fig, axes = plt.subplots(2, 1, figsize=(12, 10), facecolor="white", sharex=True)
+for ax in axes:
+    ax.set_facecolor("white")
+
+for ax, (col, nat_col, ylabel) in zip(axes, PANELS):
+    for state, grp in sq.groupby("state"):
+        grp_s = grp.sort_values("date")
+        if state in top5_st:
+            ax.plot(grp_s["date"], grp_s[col] * 100,
+                    color=top5_color[state], linewidth=1.2, alpha=0.7, label=state)
+        else:
+            ax.plot(grp_s["date"], grp_s[col] * 100,
+                    color="grey", linewidth=0.4, alpha=0.20, label="_nolegend_")
+    ax.plot(nat["date"], nat[nat_col] * 100,
+            color="#d62728", linewidth=2.2, marker="o", markersize=2.5, label="National avg")
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax.grid(True, color="lightgrey")
+    ax.legend(ncol=2, fontsize=9)
+
+#axes[0].set_title("Top-5 states by par volume highlighted; all other states in grey")
+axes[1].set_xlabel("Quarter")
+#plt.suptitle("Institutionalization of Odd-Lot Customer Trades by State (Quarterly)")
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/state_oddlot_ts.pdf"), bbox_inches="tight")
 plt.show()
 
 
@@ -653,3 +873,5 @@ plt.suptitle("Robustness: Signal Specificity — Customer vs Dealer Odd-Lots\n"
 plt.tight_layout(rect=[0, 0, 1, 0.93])
 #plt.savefig(os.path.join(OUT_DIR, "plots/institutionalization/robustness_dealer_specificity.pdf"), bbox_inches="tight")
 plt.show()
+
+
